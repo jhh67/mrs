@@ -1,0 +1,416 @@
+#!/bin/tcsh -f
+
+# MRS is a MapReduce Simulator written using tcsh and awk. See the man page for more details.
+
+# Copyright (c) 2014, Arizona Board of Regents
+# All rights reserved.
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:   
+
+# 1. Redistributions of source code must retain the above
+# copyright notice, this list of conditions and the following
+# disclaimer.
+
+# 2. Redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution. 
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+set version = "1.0"
+
+unset notify
+
+set tmp = /tmp
+set cleanup = 1
+set input = ""
+set output = ""
+set force = 0
+set mappers = ()
+set reducers = ()
+set merger = ""
+set splits = 4
+set partitions = 4
+set maxJobs=1
+set verbosity=0
+set code=1
+onintr cleanup
+
+# Process arguments
+set temp=(`getopt -s tcsh -o i:m:r:o:fj:vs:p:M:hdVt: -- $argv:q`)
+if ($? != 0) then 
+  goto usage
+endif
+
+eval set argv=\($temp:q\)
+
+while(1)
+    switch($1:q)
+        case -i:
+            set input = $2:q; shift; shift
+            breaksw
+        case -o:
+            if ($output:q != "") goto usage
+            set output = $2:q; shift; shift
+            breaksw
+        case -m:
+            set mappers = ($mappers $2:q); shift; shift
+            breaksw
+        case -r:
+            set reducers = ($reducers $2:q); shift; shift
+            breaksw
+        case -j:
+            set maxJobs = $2:q; shift; shift
+            breaksw
+        case -f:
+            set force = 1; shift
+            breaksw
+        case -v:
+            set verbosity = 1; shift
+            breaksw
+        case -s:
+            if ($?splits_specified) then
+                echo "Only one '$1' option may be specified." > /dev/stderr
+                goto usage
+            endif
+            set splits = $2:q; shift; shift
+            set splits_specified=1
+            breaksw
+        case -p:
+            if ($?partitions_specified) then
+                echo "Only one '$1' option may be specified." > /dev/stderr
+                goto usage
+            endif
+            set partitions = $2:q; shift; shift
+            set partitions_specified = 1
+            breaksw        
+        case -M:
+            set merger = $2:q; shift; shift
+            breaksw
+        case -d:
+            set cleanup = 0
+            set verbosity = 2; shift
+            breaksw
+        case -h:
+            set code = 0; shift
+            goto usage
+            breaksw      
+        case -V:
+            echo "$0 version $version"
+            goto cleanup
+            breaksw      
+        case --:
+            shift
+            break
+        case -t:
+            set tmp = $2:q; shift; shift
+            breaksw
+        default:
+            echo "Unknown option $1"
+            goto usage
+    endsw
+end
+
+
+if ($output:q == "") set output = "output"
+if ($verbosity > 1):
+     echo "output: $output"
+     echo "splits: $splits"
+     echo "partitions: $partitions"
+     echo "jobs: $maxJobs"
+
+if (! $force && -e $output:q) then
+    echo "Output directory $output already exists" > /dev/stderr
+    goto usage
+endif
+
+
+if (! -d $tmp) then
+    echo "Temporary directory $tmp does not exist" > /dev/stderr
+    goto usage
+endif
+
+set tmp = "$tmp/mrs.$$"
+if ($verbosity > 1) echo "tmpdir: $tmp"
+
+mkdir $tmp
+
+if (! -e $output:q) mkdir $output:q
+
+if ($#mappers != $#reducers) goto usage
+
+# Create helper commands
+
+cat > $tmp/mrs.gawk << 'XXXXX'
+BEGIN {
+    for (i = 0; i < 128; i++) {
+        ch = sprintf("%c", i);
+        ascii[ch] = i;
+    }
+    FS = "\t";
+    numpartitions = ARGV[numpartitions]
+    output = ARGV[output]
+}
+{
+    debug = 0
+}
+/abandoned/ {
+    debug = 0
+}
+{
+    if (debug) {
+        print $1
+    }
+    if ($1 in partitions) {
+        if (debug) {
+            print "cached"
+        }
+        partition = partitions[$1]
+    } else {
+        if (debug) {
+            print "not cached"
+        }
+        hash = 0;
+        for (i = 0; i < length($1); i++) {
+            ch = substr($1, i, 1);
+            hash = (31 * hash + ascii[ch])
+            if (hash > 100000000) {
+                hash %= 100000000
+            }
+        }
+        partition = hash % numpartitions
+        partitions[$1] = partition
+    }
+    if (debug) {
+        print partition
+    }
+    print >> output "." partition
+}
+'XXXXX'
+
+cat > $tmp/aggregate.gawk << 'XXXXX'
+BEGIN {
+    sum = 0
+    last = ""
+}
+/LongValueSum:/ {
+    split($1, parts, ":")
+    key = parts[2]
+    if (key != last && last != "") {
+        print last "\t" sum
+        sum = 0
+    }
+    sum += $2
+    last = key
+}
+
+END {
+    if (last != "") {
+        print last "\t" sum
+    }
+}
+'XXXXX'
+
+cat > $tmp/concurrent << 'XXXXX'
+#!/bin/tcsh -fx
+
+# Run up to maxJobs jobs concurrently. The jobs are read from stdin.
+
+unset notify
+
+set tmp = /tmp/concurrent.$$
+set cleanup = 0
+
+set maxJobs=1
+onintr concurrent-cleanup
+
+mkdir $tmp
+
+set temp=(`getopt -s tcsh -o j: -- $argv:q`)
+if ($? != 0) then 
+  goto concurrent-usage
+endif
+
+eval set argv=\($temp:q\)
+
+while(1)
+    switch($1:q)
+        case -j:
+            set maxJobs = $2:q; shift; shift
+            breaksw
+        case --:
+            shift
+            break
+        default:
+            goto concurrent-usage
+    endsw
+end
+
+while(1) 
+    jobs -l > $tmp/jobs
+    cat $tmp/jobs
+    set jids = `gawk '{if ($3 ~ /[0-9]+/) print $3; else print $2}' $tmp/jobs`
+    if ($#jids < $maxJobs) then
+        set cmd = $<:q
+        if ($cmd:q == "") then
+            break
+        endif
+        eval $cmd &
+        @ i++
+    else if ($#jids != 0) then
+        set done = 0
+        while (! $done)
+            sleep 1
+            foreach jid ($jids)
+                (kill -s 0 $jid >& /dev/null)
+                if ($status) then
+                    set done = 1
+                    break
+                endif
+            end
+        end
+        echo "Job done"
+    endif
+end
+wait
+
+
+concurrent-cleanup:
+    if ($cleanup) rm -rf $tmp
+    exit 0
+
+concurrent-usage:
+    echo "Usage: $0 -j maxJobs" > /dev/stderr
+    exit 1
+'XXXXX'
+
+# Done extracting helper commands 
+
+set steps = $#mappers
+set step = 0
+while ($step < $steps)
+    @ next = $step + 1
+    set stmp = $tmp/step.$step
+    mkdir $stmp
+    if ($step == 0) then
+        set stepInput = $input:q
+    else
+        set stepInput = $stepOutput
+    endif
+    if ($next == $steps && $merger:q == "") then
+        set stepOutput = $output:q
+    else
+        set stepOutput = $stmp/output
+    endif
+    if (! -e $stepOutput:q) then
+        mkdir $stepOutput:q
+    endif
+    set mapper = $mappers[1]
+    shift mappers
+    set reducer = $reducers[1]
+    shift reducers
+    if ($reducer:q == "aggregate") then
+        set reducer = "gawk -f $tmp/aggregate.gawk"
+    endif
+
+    if ($verbosity) echo "Step $step"
+    if ($verbosity) echo "Gathering input"
+
+    # Gather all the input into a single file
+    if (-d $stepInput:q) then
+        find $stepInput:q -type f -print0 | xargs -0 cat > $stmp/input
+    else
+        cat $stepInput:q > $stmp/input
+    endif
+
+    if ($verbosity) echo "Calculating splits"
+
+    # Calculate the number of lines in each split
+    set lines = `wc -l $stmp/input | gawk '{print $1}'`
+    @ split_lines = ($lines / $splits) + 1
+
+    # Split the input
+    split -l $split_lines $stmp/input $stmp/split.
+    set split_files = ($stmp/split.*)
+
+    if ($verbosity) echo "Running mappers"
+
+    # Run one mapper per split
+    cp /dev/null $stmp/mappers
+    set i=0
+    while ($i < $splits)
+        @ j = $i + 1
+        echo "$mapper:q < $split_files[$j] > $stmp/tmp.$i" >> $stmp/mappers
+        @ i++
+    end
+    $shell -f $tmp/concurrent -j $maxJobs < $stmp/mappers > /dev/null
+
+    if ($verbosity) echo "Partitioning"
+
+    # Run one partitioner per mapper output file
+    cp /dev/null $stmp/partitioners
+    set i=0
+    while ($i < $splits)
+        echo "gawk -f $tmp/mrs.gawk numpartitions=$partitions output=$stmp/part.$i $stmp/tmp.$i" >> $stmp/partitioners
+        @ i++
+    end
+    $shell -f $tmp/concurrent -j $maxJobs < $stmp/partitioners > /dev/null
+
+    if ($verbosity) echo "Running reducers"
+
+    # Run one reducer per partition
+    cp /dev/null $stmp/reducers
+    set i=0
+    while ($i < $partitions)
+        echo "cat $stmp/part.*.$i | sort | $reducer:q > $stepOutput:q/out.$i" >> $stmp/reducers
+        @ i++
+    end
+    $shell -f $tmp/concurrent -j $maxJobs < $stmp/reducers > /dev/null
+    @ step++
+end
+
+if ($merger:q != "") then
+    cat $stepOutput:q/* | $merger:q > $output:q/out.0
+endif
+if ($verbosity) echo "Done"
+
+cleanup:
+    if ($cleanup) rm -rf $tmp
+    exit 0
+
+usage:
+    cat << XXXXX > /dev/stderr
+Usage: $0 -i input -m mapper -r reducer [options]
+
+    -i input        input file(s) or directory
+    -o output       output directory (default: output)
+    -m path         mapper executable
+    -r path         reducer executable
+    -j jobs         maximum number of concurrent jobs (default: 1)
+    -s splits       number of splits (default: 4)
+    -p partitions   number of partitions (default: 4)
+    -M path         merger executable
+    -f              use existing output directory
+    -v              verbose mode
+    -d              debug mode
+    -V              print version information and exit
+    -t path         temporary directory (default: /tmp)
+    -h              show this message and exit
+
+The -i, -m, and -r arguments are required, the rest are optional. If
+multiple -m and -r arguments are specified then they represent a series of
+steps in the job -- the output from one step is the input to the next. 
+XXXXX
+    exit $code

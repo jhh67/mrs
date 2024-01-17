@@ -1,0 +1,217 @@
+.\" Copyright (c) 2014, Arizona Board of Regents
+.\" All rights reserved.
+.\" 
+.\" Redistribution and use in source and binary forms, with or without
+.\" modification, are permitted provided that the following conditions
+.\" are met:   
+.\" 
+.\" 1. Redistributions of source code must retain the above
+.\" copyright notice, this list of conditions and the following
+.\" disclaimer.
+.\" 
+.\" 2. Redistributions in binary form must reproduce the above copyright
+.\" notice, this list of conditions and the following disclaimer in the
+.\" documentation and/or other materials provided with the distribution. 
+.\" 
+.\" THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+.\" "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+.\" LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+.\" A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+.\" HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+.\" SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+.\" LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+.\" DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+.\" THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+.\" (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+.\" OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+.TH MRS 1 2014-12-12 
+.SN NAME
+mrs \- a MapReduce simulator
+.SH SYNOPSIS
+.Nm
+.Op Fl XXX
+.Op Ar
+.SH DESCRIPTION
+.I MRS 
+is the MapReduce Simulator, pronounced "missus". It simulates MapReduce by running streaming mappers
+and reducers locally. Thus it is best used for development and debugging of MapReduce jobs, although it
+may be of some practical use on multicore machines because it can run the mappers and reducers in parallel. It is not optimized in any way, really, and therefore
+does a lot of data copying, for example It has the following features:
+
+.IP \(bu 4
+implements Hadoop streaming interface
+.IP \(bu 4
+runs mappers and reducers in parallel
+.IP \(bu 4
+supports jobs with multiple steps
+.IP \(bu 4
+provides an optional merge phase to merge reducer output files
+
+MRS uses  arguments to specify its input, output, reducers,
+mappers, and optional merger.
+The input is assumed to be text, and it is split into several
+.I splits
+each with a roughly equal number of lines (the split boundaries occur at 
+the ends of lines, ensuring that a line is not divided between splits). 
+The number of splits is configurable.
+Each split is fed into a mapper. 
+
+Each mapper produces a list of textual key/value pairs.
+Each pair must appear on a single line of the output, 
+and the key 
+must be separated from
+the value by a tab character. 
+The output from each mapper is partitioned into a configurable number of
+partitions such that all key/value pairs from all mappers that have the same key
+appear in the same partition. 
+
+The key/value pairs in a partition are sorted by key and fed into the reducer. 
+The output from each reducer is stored in a separate file in the output directory. 
+
+If multiple mappers and reducers are specified
+then they are interpreted as multiple steps of the job. The first mapper and reducer 
+arguments are used to implement the first step, the second arguments implement the second step, etc. The input to the first step is specified by the input
+argument, and the inputs to the subsequent steps are the output from the 
+previous step. The output from the last stop is specified by the output argument.
+
+The 
+.SH OPTIONS
+.TP
+.BI "\-i " input
+Specifies the input file(s) or directories. 
+If 
+.I input
+is a directory then all files in the directory hierarchy rooted at 
+.I input 
+are used. Multiple 
+.B -i
+options may be used to specify multiple input files and/or directories.
+.TP
+.BI "\-o " output
+Use
+.I output
+as the the output directory.
+If this argument is not specified, then "output" in the current directory
+is used.
+It is an error for 
+.I output
+to exist; use the 
+.B -f
+option to override this. 
+.TP
+.BI "\-m " mapper
+Specifies the mapper executable. The 
+.I mapper
+must either be an absolute path, a relative path, or a command
+found in the shell's path. 
+If multiple
+.B -m
+arguments are specified then each represents the mapper for one step in the job,
+in order. 
+The number of mappers must equal the number of reducers. 
+If an
+identity mapper is required then use the Unix command "cat".
+.TP
+.BI "\-r " reducer
+Specifies the reducer executable. The 
+.I reducer
+must either be an absolute path, a relative path,  a command
+found in the shell's path, or the word "aggregate". 
+If the reducer is "aggregate" then the Hadoop "aggregate" reducer
+functionality is mimiced -- 
+the values of the keys that start with "LongValueSum:" are summed. 
+If multiple
+.B -r
+arguments are specified then each represents the reducer for one step in the job,
+in order. 
+The number of reducers must equal the number of mappers. 
+If an
+identity reducer is required then use the Unix command "cat".
+.TP
+.BI "\-j " jobs
+The maximum number of jobs (mappers or reducers) to run simultaneously. 
+The default is 1.
+.TP
+.BI "\-s " splits
+The number of splits in the input. 
+The default is 4.
+.TP
+.BI "\-p " partitions
+The number of partitions. The default is 4.
+.TP
+.BI "\-M " merger
+Specifies the merger executable. 
+This executable is fed the output from the reducers in the last step
+and is used to merge that output into a single file.
+.B -f
+Forces the output directory to be used even if it already exists.
+.B -v
+Enables verbose mode.
+.B -d
+Enables debug mode. Its major feature is that the temporary directory is not
+deleted when the job completes, allowing its contents to be examined.
+.B -V
+Prints version information and exits.
+.B -D
+Dumps the source to this man page.
+.BI "\-t " path
+Creates the temporary directory in  
+.I path.
+The default is "/tmp".
+.B -h
+Print usage information and exits.
+.SH EXIT STATUS
+Returns 1 if there was an error, 0 otherwise.
+.SH EXAMPLES
+.PP
+The command 
+.PP
+mrs -i input -m ./mapper.py -r ./reducer.py
+.PP
+runs 
+.I ./mapper.py 
+for the mappers and
+.I ./reducer.py 
+for the reducers.
+The 
+contents of the file or directory
+.I input
+are provided as input to the mappers, and the output from
+the reducers are stored in separate files in the "output" directory
+(the default).
+.PP
+The command
+.PP
+mrs -i input -m ./mapper.py -r ./reducer.py -s 10 -p 5
+.PP
+has the same effect as above except that the input is divided into
+10 splits, each of which is fed to a separate mapper,
+and the mapper output is divided into 5 partitions, each of which is
+fed into a separate reducer.
+The command
+.PP
+mrs -i input -m ./mapper1.py -r ./reducer1.py -m ./mapper2.py -r ./reducer2.py
+.PP
+runs the job in two steps. 
+The first step uses 
+.I ./mapper1.py and 
+.I ./reducer1.py 
+for the mappers and reducers,
+respectively, with 
+.I input used as the input to the mappers.
+The output is stored in a temporary directory.
+The second step
+uses 
+.I ./mapper2.py and 
+.I ./reducer2.py 
+for the mappers and reducers,
+respectively, with the output from the first
+step used as the input to the mappers, 
+and the output from the reducers stored in the "output" directory (the default).
+.SH AUTHOR
+John H. Hartman
+
+
+
+
+
